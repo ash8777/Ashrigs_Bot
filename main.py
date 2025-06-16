@@ -1,52 +1,56 @@
-import discord, os, json, logging, re
+import discord, os, json, logging, re, asyncio
 from discord.ext import commands
 from dotenv import load_dotenv
 from typing import List, Dict
 
-# ── ENV ────────────────────────────────────────────────────────────────────
+# ── ENV ─────────────────────────────────────────────
 load_dotenv()
 DISCORD_TOKEN    = os.getenv("DISCORD_TOKEN")
 TRAINING_CHANNEL = os.getenv("TRAINING_CHANNEL", "bot-training")
 LOG_CHANNEL_NAME = os.getenv("LOG_CHANNEL", "bot-log")
 MEMORY_FILE      = "memory.json"
 
-# ── LOGGING ────────────────────────────────────────────────────────────────
+# ── LOGGING ─────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 from transformers.utils import logging as hf_log
 hf_log.set_verbosity_error()
 
-# ── BOT SETUP ──────────────────────────────────────────────────────────────
+# ── BOT ─────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
-intents.presences = True          # shows a green status-dot
+intents.presences       = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 
-# ── MEMORY HELPERS ────────────────────────────────────────────────────────
+# ── MEMORY ──────────────────────────────────────────
 if not os.path.exists(MEMORY_FILE):
     json.dump([], open(MEMORY_FILE, "w"))
 
 def load_mem() -> List[Dict]:
     return json.load(open(MEMORY_FILE))
 
-def save_mem(data: List[Dict]):
-    json.dump(data, open(MEMORY_FILE, "w"), indent=2)
+def save_mem(m: List[Dict]):
+    json.dump(m, open(MEMORY_FILE, "w"), indent=2)
 
-# ── SIMILARITY  (Sentence-Transformers) ───────────────────────────────────
+# ── EMBEDDINGS (run in worker thread) ───────────────
 from sentence_transformers import SentenceTransformer, util
-model = SentenceTransformer("all-MiniLM-L6-v2")
+_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-def best(query: str, mem: List[Dict], k: int = 3):
-    q_emb = model.encode(query, convert_to_tensor=True)
+async def embed(text: str):
+    """Run model.encode off-loop to avoid blocking heartbeats."""
+    return await asyncio.to_thread(_model.encode, text, convert_to_tensor=True)
+
+async def best(query: str, mem: List[Dict], k: int = 3):
+    q_emb = await embed(query)
     scored = []
     for item in mem:
         text = item["question"] if item["type"] == "qa" else item["content"]
-        emb  = model.encode(text, convert_to_tensor=True)
+        emb  = await embed(text)
         scored.append((util.cos_sim(q_emb, emb).item(), item))
     scored.sort(reverse=True)
     return scored[:k]
 
-# ── EVENTS ────────────────────────────────────────────────────────────────
+# ── EVENTS ──────────────────────────────────────────
 @bot.event
 async def on_ready():
     await bot.change_presence(status=discord.Status.online)
@@ -60,21 +64,18 @@ async def on_message(msg: discord.Message):
     mem    = load_mem()
     log_ch = discord.utils.get(msg.guild.text_channels, name=LOG_CHANNEL_NAME)
 
-    # ─ Training channel ───────────────────────────────────────────────────
+    # ─ training channel ─
     if msg.channel.name == TRAINING_CHANNEL:
         txt = msg.content.strip()
         if txt.lower().startswith("fact:"):
             body   = txt[5:].strip()
             parts  = re.split(r"[\\n\\r•\\-]+|\\.\\s+", body)
-            added  = 0
-            for p in parts:
-                s = p.strip()
-                if len(s) > 15:
-                    mem.append({"type": "fact", "content": s})
-                    added += 1
+            chunks = [p.strip() for p in parts if len(p.strip()) > 15]
+            for c in chunks:
+                mem.append({"type": "fact", "content": c})
             save_mem(mem)
             await msg.add_reaction("✅")
-            await msg.reply(f"Saved {added} FACT chunk(s).", delete_after=3)
+            await msg.reply(f"Saved {len(chunks)} FACT chunk(s).", delete_after=3)
             return
 
         if txt.startswith("Q:") and "\\n" in txt:
@@ -87,10 +88,8 @@ async def on_message(msg: discord.Message):
                 await msg.add_reaction("✅")
             return
 
-    # ─ Retrieval / auto-reply ─────────────────────────────────────────────
-    MIN_SIM = 0.30                                 # lowered threshold
-    matches = best(msg.content, mem)
-
+    # ─ retrieval ─
+    matches = await best(msg.content, mem)
     if not matches:
         return
 
@@ -98,15 +97,13 @@ async def on_message(msg: discord.Message):
     if log_ch:
         await log_ch.send(f"⚖️ Similarity {top_sim:.2f} for “{msg.content[:120]}…”")
 
-    if top_sim < MIN_SIM:
+    if top_sim < 0.30:            # threshold
         return
 
-    # direct Q-A
     if top_item["type"] == "qa":
         await msg.channel.send(top_item["answer"])
         return
 
-    # build reply from FACTs
     context = "\\n".join(f"• {m[1]['content']}" for m in matches if m[1]["type"] == "fact")
     reply   = f"📌 Based on what I know:\\n{context}"
     if len(reply) > 2000:
@@ -115,29 +112,16 @@ async def on_message(msg: discord.Message):
 
     await bot.process_commands(msg)
 
-# ─ Commands ───────────────────────────────────────────────────────────────
+# ─ commands ─────────────────────────────────────────
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def check(ctx, *, query):
-    """DM the best match & score (debug)."""
     mem = load_mem()
-    m   = best(query, mem, 1)
+    m   = await best(query, mem, 1)
     if not m:
         return await ctx.reply("No match.")
-    await ctx.author.send(f"{m[0][0]:.2f} – {m[0][1]}")
+    await ctx.reply(f"{m[0][0]:.2f} – {m[0][1]}")
 
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def train(ctx, *, text):
-    """/train question || answer"""
-    if "||" not in text:
-        return await ctx.send("Usage: /train question || answer")
-    q, a = [p.strip() for p in text.split("||", 1)]
-    mem  = load_mem()
-    mem.append({"type": "qa", "question": q, "answer": a})
-    save_mem(mem)
-    await ctx.send("Training added ✅")
-
-# ─ Run ────────────────────────────────────────────────────────────────────
+# ─ run ──────────────────────────────────────────────
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
