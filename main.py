@@ -82,14 +82,17 @@ async def on_message(message: discord.Message):
     facts = best_facts(message.content, memory)
     if facts and facts[0].get("type") == "qa":
         await message.channel.send(facts[0]["answer"])
+        return
     elif facts and any(f["type"] == "fact" for f in facts):
         context = "\n".join(
             f"• {f['content'] if f['type']=='fact' else f['answer']}"
             for f in facts
         )
-        await message.channel.send(f"📌 I found this based on what I know:\n{context}")
+        reply_text = f"📌 I found this based on what I know:\n{context}"
+        if len(reply_text) > 2000:
+            reply_text = reply_text[:1990] + "\n... (truncated)"
+        await message.channel.send(reply_text)
     else:
-        # No reply if bot doesn’t know
         print("No match found — skipping reply.")
 
     await bot.process_commands(message)
