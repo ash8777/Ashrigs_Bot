@@ -1,5 +1,3 @@
-# main.py – QA + FACT knowledge support bot
-
 import discord
 from discord.ext import commands
 import os
@@ -9,79 +7,46 @@ import openai
 from dotenv import load_dotenv
 from typing import List, Dict
 
-# ---------------------------------------------------------------------------
-# ENV SETTINGS (Railway / .env)
-# ---------------------------------------------------------------------------
 load_dotenv()
 
 DISCORD_TOKEN    = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
 TRAINING_CHANNEL = os.getenv("TRAINING_CHANNEL", "bot-training")
-LOG_CHANNEL      = os.getenv("LOG_CHANNEL", "bot-logs")
+LOG_CHANNEL_NAME = os.getenv("LOG_CHANNEL", "bot-log")
 MODEL_NAME       = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+MEMORY_FILE      = "memory.json"
 
-MEMORY_FILE = "memory.json"
-
-# ---------------------------------------------------------------------------
-# DISCORD SETUP
-# ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 
-# ---------------------------------------------------------------------------
-# MEMORY HELPERS
-# ---------------------------------------------------------------------------
 if not os.path.exists(MEMORY_FILE):
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+    with open(MEMORY_FILE, "w") as f:
         json.dump([], f)
 
-def load_memory() -> List[Dict]:
-    with open(MEMORY_FILE, encoding="utf-8") as f:
+def load_memory():
+    with open(MEMORY_FILE) as f:
         return json.load(f)
 
-def save_memory(data: List[Dict]):
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+def save_memory(data):
+    with open(MEMORY_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
-# ---------------------------------------------------------------------------
-# OPENAI HELPER (using 0.28.x client)
-# ---------------------------------------------------------------------------
-openai.api_key = OPENAI_API_KEY
-async def fetch_openai_response(prompt: str) -> str:
-    """Async wrapper around OpenAI ChatCompletion (0.28.x)"""
-    response = await openai.ChatCompletion.acreate(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": "You are a helpful FiveM support assistant."},
-            {"role": "user", "content": prompt}
-        ]
-    )
-    return response.choices[0].message.content.strip()
+def best_facts(query: str, memory: List[Dict], top_k: int = 3):
+    from sentence_transformers import SentenceTransformer, util
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    query_emb = model.encode(query, convert_to_tensor=True)
 
-# ---------------------------------------------------------------------------
-# SIMPLE RETRIEVAL (exact QA + keyword FACT)
-# ---------------------------------------------------------------------------
+    results = []
+    for item in memory:
+        content = item.get("question") if item.get("type") == "qa" else item.get("content")
+        if not content: continue
+        item_emb = model.encode(content, convert_to_tensor=True)
+        sim = util.cos_sim(query_emb, item_emb).item()
+        results.append((sim, item))
+    results.sort(reverse=True)
+    return [item for _, item in results[:top_k]]
 
-def exact_qa_match(query: str, memory: List[Dict]):
-    for entry in memory:
-        if entry.get("type", "qa") == "qa" and query.lower() == entry["question"].lower():
-            return entry["answer"]
-    return None
-
-def gather_relevant_facts(query: str, memory: List[Dict], limit: int = 5):
-    words = set(w.lower() for w in query.split())
-    hits = []
-    for entry in memory:
-        if entry.get("type") == "fact":
-            text = entry["content"].lower()
-            if any(w in text for w in words):
-                hits.append(entry["content"])
-    return hits[:limit]
-
-# ---------------------------------------------------------------------------
-# EVENTS
-# ---------------------------------------------------------------------------
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
@@ -93,21 +58,16 @@ async def on_message(message: discord.Message):
         return
 
     memory = load_memory()
+    log_channel = discord.utils.get(message.guild.text_channels, name=LOG_CHANNEL_NAME)
 
-    # ---------------- Training channel ----------------
     if message.channel.name == TRAINING_CHANNEL:
         content = message.content.strip()
-
-        # FACT: ...
         if content.lower().startswith("fact:"):
             fact = content[5:].strip()
             memory.append({"type": "fact", "content": fact})
             save_memory(memory)
             await message.add_reaction("✅")
-            return
-
-        # Q: ...\nA: ...
-        if content.startswith("Q:") and "\n" in content:
+        elif content.startswith("Q:") and "\n" in content:
             q_line, a_line = content.split("\n", 1)
             if a_line.startswith("A:"):
                 memory.append({
@@ -117,41 +77,27 @@ async def on_message(message: discord.Message):
                 })
                 save_memory(memory)
                 await message.add_reaction("✅")
-        return  # never auto‑reply in training channel
-
-    # ---------------- Normal channels ----------------
-    # 1) exact QA answer
-    match = exact_qa_match(message.content, memory)
-    if match:
-        await message.channel.send(match)
         return
 
-    # 2) build context from facts + optionally GPT
-    facts = gather_relevant_facts(message.content, memory)
-    context = "\n".join(f"• {f}" for f in facts) if facts else "(no saved facts matched)"
-
-    prompt = (
-        "Known facts about troubleshooting FiveM assets/maps:\n" + context + "\n\n" +
-        f"Customer says: {message.content}\n" +
-        "Provide a concise, helpful reply that references the facts when relevant."
-    )
-
-    try:
-        reply = await fetch_openai_response(prompt)
-        await message.channel.send(reply)
-    except Exception as e:
-        print("OpenAI error", e)
+    facts = best_facts(message.content, memory)
+    if facts and facts[0].get("type") == "qa":
+        await message.channel.send(facts[0]["answer"])
+    elif facts and any(f["type"] == "fact" for f in facts):
+        context = "\n".join(
+            f"• {f['content'] if f['type']=='fact' else f['answer']}"
+            for f in facts
+        )
+        await message.channel.send(f"📌 I found this based on what I know:\n{context}")
+    else:
+        # No reply if bot doesn’t know
+        print("No match found — skipping reply.")
 
     await bot.process_commands(message)
 
-# ---------------------------------------------------------------------------
-# COMMAND: /train  (legacy)
-# ---------------------------------------------------------------------------
 @bot.command()
 async def train(ctx, *, text):
-    """/train question || answer  – legacy quick add"""
     if "||" not in text:
-        await ctx.send("Format: /train question || answer")
+        await ctx.send("Format should be: /train question || answer")
         return
     q, a = [part.strip() for part in text.split("||", 1)]
     memory = load_memory()
@@ -159,9 +105,5 @@ async def train(ctx, *, text):
     save_memory(memory)
     await ctx.send("Training example added ✅")
 
-# ---------------------------------------------------------------------------
-# RUN
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("DEBUG ▸ DISCORD_TOKEN length:", len(DISCORD_TOKEN) if DISCORD_TOKEN else "None")
     bot.run(DISCORD_TOKEN)
