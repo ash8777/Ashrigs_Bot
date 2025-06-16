@@ -105,3 +105,4 @@ async def train(ctx, *, text):
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
+print("DEBUG  ▸ DISCORD_TOKEN length:", len(DISCORD_TOKEN) if DISCORD_TOKEN else "None")
