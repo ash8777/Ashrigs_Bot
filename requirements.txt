@@ -1,4 +1,8 @@
 discord.py==2.3.2
 python-dotenv
 openai
-sentence-transformers
+sentence-transformers==2.2.2
+torch==2.0.1+cpu
+transformers==4.35.0
+scipy
+--extra-index-url https://download.pytorch.org/whl/cpu
