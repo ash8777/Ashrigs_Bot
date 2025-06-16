@@ -3,7 +3,7 @@ python-dotenv
 openai
 sentence-transformers==2.2.2
 torch==2.0.1+cpu
-numpy==1.26.4            # <-- pin below 2.0
+numpy==1.26.4            # <-- new line, forces NumPy < 2
 scipy==1.11.4
 transformers==4.35.0
 --extra-index-url https://download.pytorch.org/whl/cpu
